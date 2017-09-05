@@ -1,12 +1,17 @@
 
 open Values
+open Byteutil
+open Ast
+open Mrun
+open Types
 
-let trace = Merkle.trace
+let op x = Char.chr x
 
-type stream = {
-  buf : Buffer.t;
-  patches : (int * char) list ref
-}
+let type_code = function
+ | I32Type -> 0
+ | I64Type -> 1
+ | F32Type -> 2
+ | F64Type -> 3
 
 (* type strems with different insetions methods *)
 let stream () = {buf = Buffer.create 8192; patches = ref []}
@@ -75,15 +80,19 @@ let value = function
 let get_value v =
   value v;
   extend (to_bytes s) 32
+(* cannot be zero because of size_code *)
+let sz_code = function
+ | Memory.Mem8 -> 1
+ | Memory.Mem16 -> 2
+ | Memory.Mem32 -> 3
 
-let get_value8 v =
-  value v;
-  extend (to_bytes s) 8
+let ext_code = function
+ | Memory.SX -> 0
+ | Memory.ZX -> 0
 
-open Ast
-open Mrun
-
-let op x = Char.chr x
+let size_code = function
+ | None -> 0
+ | Some (sz, ext) -> (sz_code sz lsl 1) lor ext_code ext
 
 (* WASM opcodes *)
 
@@ -92,6 +101,8 @@ let alu_byte = function
  | Trap -> op 0x01
  | Min -> op 0x02
  | CheckJump -> op 0x03
+ | FixMemory (ty, sz) -> (* type, sz, ext : 4 * 3 * 2 = 24 *)
+    op (0xc0 lor (type_code ty lsl 6) lor size_code sz);
       | Test (I32 I32Op.Eqz) -> op 0x45
       | Test (I64 I64Op.Eqz) -> op 0x50
       | Test (F32 _) -> assert false
@@ -255,13 +266,20 @@ let in_code_byte = function
  | BreakLocInReg -> 0x0c
  | BreakStackInReg -> 0x0d
  | CallIn -> 0x0e
- | MemoryIn -> 0x0f
+ | MemoryIn1 -> 0x0f
  | TableIn -> 0x10
+ | MemoryIn2 -> 0x11
 
 let reg_byte = function
  | Reg1 -> 0x01
  | Reg2 -> 0x02
  | Reg3 -> 0x03
+
+let out_sz_code = function
+ | None -> 0
+ | Some Memory.Mem8 -> 1
+ | Some Memory.Mem16 -> 2
+ | Some Memory.Mem32 -> 3
 
 let out_code_byte = function
  | NoOut -> 0x00
@@ -269,11 +287,12 @@ let out_code_byte = function
  | StackOutReg1 -> 0x02
  | StackOut0 -> 0x03
  | StackOut1 -> 0x04
- | MemoryOut -> 0x05
+ | MemoryOut1 sz -> 0xa0 lor out_sz_code sz
  | CallOut -> 0x06
  | BreakLocOut -> 0x07
  | GlobalOut -> 0x08
  | StackOut2 -> 0x09
+ | MemoryOut2 sz -> 0xc0 lor out_sz_code sz
 
 let stack_ch_byte = function
  | StackRegSub -> 0x00
@@ -283,6 +302,7 @@ let stack_ch_byte = function
  | StackInc -> 0x04
  | StackDec -> 0x05
  | StackNop -> 0x06
+ | StackDec2 -> 0x07
 
 (*
 we have 31 bytes
@@ -404,7 +424,7 @@ let u256 i = get_value (I32 (Int32.of_int i))
 
 let hash_vm vm =
   let hash_code = get_hash (Array.map (fun v -> microp_word (get_code v)) vm.code) in
-  let hash_mem = get_hash (Array.map (fun v -> get_value v) vm.memory) in
+  let hash_mem = get_hash (Array.map (fun v -> get_value (I64 v)) vm.memory) in
   let hash_stack = get_hash (Array.map (fun v -> get_value v) vm.stack) in
   let hash_global = get_hash (Array.map (fun v -> get_value v) vm.globals) in
   let hash_call = get_hash (Array.map (fun v -> u256 v) vm.call_stack) in
@@ -463,7 +483,7 @@ let hash_vm_bin vm =
 
 let vm_to_bin vm = {
   bin_code = get_hash (Array.map (fun v -> microp_word (get_code v)) vm.code);
-  bin_memory = get_hash (Array.map (fun v -> get_value v) vm.memory);
+  bin_memory = get_hash (Array.map (fun v -> get_value (I64 v)) vm.memory);
   bin_stack = get_hash (Array.map (fun v -> get_value v) vm.stack);
   bin_globals = get_hash (Array.map (fun v -> get_value v) vm.globals);
   bin_call_stack = get_hash (Array.map (fun v -> u256 v) vm.call_stack);
@@ -518,14 +538,6 @@ let hash_machine m =
   hash#add_string (get_value m.m_regs.reg3);
   hash#add_string (get_value m.m_regs.ireg);
   hash#result
-
-let w256_to_string bs =
-  let res = ref "" in
-  for i = 0 to Bytes.length bs - 1 do
-    let code = Char.code bs.[i] in
-    res := !res ^ (if code < 16 then "0" else "") ^ Printf.sprintf "%x" code
-  done;
-  !res
 
 let hash_machine_bin m =
   let hash = Hash.keccak 256 in

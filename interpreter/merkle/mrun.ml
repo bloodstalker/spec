@@ -8,7 +8,7 @@ open Values
 type vm = {
   code : inst array;
   stack : value array;
-  memory : value array;
+  memory : Int64.t array;
   break_stack : (int*int) array;
 (*  call_stack : (int*int*int) array; *)
   call_stack : int array;
@@ -37,14 +37,14 @@ let inc_pc vm = vm.pc <- vm.pc+1
 let create_vm code =
   { code = Array.of_list code;
     stack = Array.make 10000 (i 0);
-    memory = Array.make 10000 (i 0);
+    memory = Array.make 10000 0L;
     call_stack = Array.make 10000 0;
     break_stack = Array.make 10000 (0,0);
     globals = Array.make 1000 (i 0);
     calltable = Array.make 10000 0;
     pc = 0;
     stack_ptr = 0;
-    memsize = 10000;
+    memsize = 0;
     break_ptr = 0;
     call_ptr = 0; }
 
@@ -66,9 +66,22 @@ type in_code =
  | BreakLocInReg
  | BreakStackInReg
  | CallIn
- | MemoryIn
+ | MemoryIn1
  | MemsizeIn
  | TableIn
+ | MemoryIn2
+
+type alu_code =
+ | Unary of Ast.unop
+ | Convert of Ast.cvtop
+ | Binary of Ast.binop
+ | Compare of Ast.relop
+ | Test of Ast.testop
+ | Trap
+ | Min
+ | CheckJump
+ | Nop
+ | FixMemory of Types.value_type * (Memory.mem_size * Memory.extension) option
 
 type reg =
  | Reg1
@@ -82,7 +95,6 @@ type out_code =
  | StackOut0
  | StackOut1
  | StackOut2
- | MemoryOut
  | CallOut
  | NoOut
  | GlobalOut
@@ -99,6 +111,8 @@ type alu_code =
  | Min
  | CheckJump
  | Nop
+ | MemoryOut1 of Memory.mem_size option
+ | MemoryOut2 of Memory.mem_size option
 
 type stack_ch =
  | StackRegSub
@@ -108,6 +122,7 @@ type stack_ch =
  | StackInc
  | StackDec
  | StackNop
+ | StackDec2
 
 type microp = {
   read_reg1 : in_code;
@@ -162,7 +177,8 @@ let read_register vm reg = function
  | BreakLocInReg -> i (fst (vm.break_stack.(vm.break_ptr-1-value_to_int reg.reg1)))
  | BreakStackInReg -> i (snd (vm.break_stack.(vm.break_ptr-1-value_to_int reg.reg1)))
  | CallIn -> i vm.call_stack.(vm.call_ptr-1)
- | MemoryIn -> vm.memory.(value_to_int reg.reg1+value_to_int reg.reg2)
+ | MemoryIn1 -> I64 vm.memory.((value_to_int reg.reg1+value_to_int reg.ireg) / 8)
+ | MemoryIn2 -> I64 vm.memory.((value_to_int reg.reg1+value_to_int reg.ireg) / 8 + 1)
  | MemsizeIn -> i vm.memsize
  | TableIn -> i vm.calltable.(value_to_int reg.reg1)
 
@@ -171,11 +187,26 @@ let get_register regs = function
  | Reg2 -> regs.reg2
  | Reg3 -> regs.reg3
 
+let get_memory mem loc = Byteutil.mini_memory mem.(loc/8) mem.(loc/8+1)
+
+let memop mem v addr = function
+ | None -> Memory.store mem addr 0l v
+ | Some sz -> Memory.store_packed sz mem addr 0l v
+
 let write_register vm regs v = function
  | NoOut -> ()
  | GlobalOut -> vm.globals.(value_to_int regs.reg1) <- v
  | CallOut -> vm.call_stack.(vm.call_ptr) <- value_to_int v
- | MemoryOut -> vm.memory.(value_to_int regs.reg1+value_to_int regs.reg2) <- v
+ | MemoryOut1 sz ->
+    let loc = value_to_int regs.reg1+value_to_int regs.ireg in
+    let mem = get_memory vm.memory loc in
+    memop mem v (Int64.of_int (loc-(loc/8)*8)) sz;
+    vm.memory.(loc/8) <- fst (Byteutil.Decode.mini_memory mem)
+ | MemoryOut2 sz ->
+    let loc = value_to_int regs.reg1+value_to_int regs.ireg in
+    let mem = get_memory vm.memory loc in
+    memop mem v (Int64.of_int (loc-(loc/8)*8)) sz;
+    vm.memory.(loc/8+1) <- snd (Byteutil.Decode.mini_memory mem)
  | StackOut0 ->
     trace ("push to stack: " ^ string_of_value v);
     vm.stack.(vm.stack_ptr) <- v
@@ -193,16 +224,51 @@ let write_register vm regs v = function
    let (a,b) = vm.break_stack.(vm.break_ptr) in
    vm.break_stack.(vm.break_ptr) <- (a, value_to_int v)
 
+let setup_memory vm m instance =
+  let open Ast in
+  let open Types in
+  let open Source in
+  List.iter (function MemoryType {min; _} ->
+    trace ("Memory size " ^ Int32.to_string min);
+    vm.memsize <- Int32.to_int min) (List.map (fun a -> a.it.mtype) m.memories);
+  trace ("Segments: " ^ string_of_int (List.length m.data));
+  let set_byte loc v =
+    let mem = get_memory vm.memory loc in
+    memop mem v (Int64.of_int (loc-(loc/8)*8)) (Some Memory.Mem8);
+    let a, b = Byteutil.Decode.mini_memory mem in
+    vm.memory.(loc/8) <- a;
+    vm.memory.(loc/8+1) <- b in
+  let init (dta:bytes Ast.segment) =
+    let offset = value_to_int (Eval.eval_const instance dta.it.offset) in
+    let sz = Bytes.length dta.it.init in
+    for i = 0 to sz-1 do
+      set_byte (offset+i) (I32 (Int32.of_int (Char.code (Bytes.get dta.it.init i))))
+    done in 
+  List.iter init m.data;
+  ()
+
 let handle_ptr regs ptr = function
  | StackRegSub -> ptr - value_to_int regs.reg1
  | StackReg -> value_to_int regs.reg1
  | StackReg2 -> value_to_int regs.reg2
  | StackReg3 -> value_to_int regs.reg3
  | StackInc -> ptr + 1
+ | StackDec2 -> ptr - 2
  | StackDec -> ptr - 1
  | StackNop -> ptr
 
-let handle_alu r1 r2 r3 = function
+let load r2 r3 ty sz loc =
+  let open Byteutil in
+  let mem = mini_memory_v r2 r3 in
+  trace ("LOADING " ^ w256_to_string (get_value r2) ^ " & " ^ Byteutil.w256_to_string (get_value r3));
+  trace ("Get memory: " ^ w256_to_string (Memory.to_bytes mem));
+  let addr = Int64.of_int (loc-(loc/8)*8) in
+  ( match sz with
+  | None -> Memory.load mem addr 0l ty
+  | Some (sz, ext) -> Memory.load_packed sz ext mem addr 0l ty )
+
+let handle_alu r1 r2 r3 ireg = function
+ | FixMemory (ty, sz) -> load r2 r3 ty sz (value_to_int r1+value_to_int ireg)
  | Min -> i (min (value_to_int r1) (value_to_int r2))
  | Convert op -> Eval_numeric.eval_cvtop op r1
  | Unary op -> Eval_numeric.eval_unop op r1
@@ -215,6 +281,8 @@ let handle_alu r1 r2 r3 = function
    trace ("check jump " ^ string_of_value r2 ^ " jump to " ^ string_of_value r1 ^ " or " ^ string_of_value r3);
    if value_bool r2 then r1 else i (value_to_int r3)
 
+open Ast
+
 let get_code = function
  | NOP -> noop
  | UNREACHABLE -> {noop with alu_code=Trap}
@@ -226,9 +294,9 @@ let get_code = function
  | POPBRK -> {noop with break_ch=StackDec}
  | BREAK -> {noop with read_reg1 = BreakLocIn; read_reg2 = BreakStackIn; break_ch=StackDec; stack_ch=StackReg2; pc_ch=StackReg}
  | RETURN -> {noop with read_reg1=CallIn; call_ch=StackDec; pc_ch=StackReg}
- (* Reg12: memory address *)
- | LOAD x -> {noop with immed=i x; read_reg1=Immed; read_reg2=StackIn0; read_reg3=MemoryIn; write1=(Reg3, StackOut1)}
- | STORE x -> {noop with immed=i x; read_reg1=Immed; read_reg2=StackIn0; read_reg3=StackIn1; write1=(Reg3, MemoryOut); stack_ch=StackDec}
+ (* IReg + Reg1: memory address *)
+ | LOAD x -> {noop with immed=I32 x.offset; read_reg1=StackIn0; read_reg2=MemoryIn1; read_reg3=MemoryIn2; alu_code=FixMemory (x.ty, x.sz); write1=(Reg1, StackOut1)}
+ | STORE x -> {noop with immed=I32 x.offset; read_reg1=StackIn1; read_reg2=StackIn0; write1=(Reg2, MemoryOut1 x.sz); write2=(Reg2, MemoryOut2 x.sz); stack_ch=StackDec2}
  | DROP -> {noop with stack_ch=StackDec}
  | DUP x -> {noop with immed=i x; read_reg1=Immed; read_reg2=StackInReg; write1=(Reg2, StackOut0); stack_ch=StackInc}
  | SWAP x -> {noop with immed=i x; read_reg1=Immed; read_reg2=StackIn0; write1=(Reg2, StackOutReg1)}
@@ -260,7 +328,7 @@ let micro_step vm =
   trace "read R3";
   regs.reg3 <- read_register vm regs op.read_reg3;
   (* ALU *)
-  regs.reg1 <- handle_alu regs.reg1 regs.reg2 regs.reg3 op.alu_code;
+  regs.reg1 <- handle_alu regs.reg1 regs.reg2 regs.reg3 regs.ireg op.alu_code;
   (* Write registers *)
   let w1 = get_register regs (fst op.write1) in
   trace ("write 1: " ^ string_of_value w1);
@@ -307,11 +375,22 @@ let vm_step vm = match vm.code.(vm.pc) with
    vm.call_ptr <- vm.call_ptr - 1
  | LOAD x ->
    inc_pc vm;
-   vm.stack.(vm.stack_ptr-1) <- vm.memory.(value_to_int vm.stack.(vm.stack_ptr-1) + x)
+   let loc = value_to_int vm.stack.(vm.stack_ptr-1) + Int32.to_int x.offset in
+   let a = vm.memory.(loc/8) in
+   let b = vm.memory.(loc/8+1) in
+   vm.stack.(vm.stack_ptr-1) <- load (I64 a) (I64 b) x.ty x.sz loc
  | STORE x ->
+   let open Byteutil in
    inc_pc vm;
-   vm.memory.(value_to_int vm.stack.(vm.stack_ptr-1) + x) <- vm.stack.(vm.stack_ptr-2);
-   vm.stack_ptr <- vm.stack_ptr - 1
+   let loc = value_to_int vm.stack.(vm.stack_ptr-2) + Int32.to_int x.offset in
+   let mem = get_memory vm.memory loc in
+   let v = vm.stack.(vm.stack_ptr-1) in
+   memop mem v (Int64.of_int (loc-(loc/8)*8)) x.sz;
+   let a, b = Byteutil.Decode.mini_memory mem in
+   vm.memory.(loc/8) <- a;
+   vm.memory.(loc/8+1) <- b;
+   trace ("STORING " ^ Byteutil.w256_to_string (get_value (I64 a)) ^ " & " ^ Byteutil.w256_to_string (get_value (I64 b)));
+   vm.stack_ptr <- vm.stack_ptr - 2
  | DROP ->
    inc_pc vm;
    vm.stack_ptr <- vm.stack_ptr - 1
@@ -390,8 +469,8 @@ let trace_step vm = match vm.code.(vm.pc) with
  | POPBRK -> "POPBRK"
  | BREAK -> "BREAK"
  | RETURN -> "RETURN"
- | LOAD x -> "LOAD (broken)"
- | STORE x -> "STORE (broken)"
+ | LOAD x -> "LOAD from " ^ string_of_value vm.stack.(vm.stack_ptr-1)
+ | STORE x -> "STORE " ^ string_of_value vm.stack.(vm.stack_ptr-1) ^ " to " ^ string_of_value vm.stack.(vm.stack_ptr-2)
  | DROP -> "DROP"
  | DUP x -> "DUP" ^ string_of_int x ^ ": " ^ string_of_value vm.stack.(vm.stack_ptr-x)
  | SWAP x -> "SWAP " ^ string_of_int x
