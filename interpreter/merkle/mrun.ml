@@ -3,6 +3,7 @@ open Merkle
 open Values
 
 
+(* the IR vm *)
 
 type vm = {
   code : inst array;
@@ -47,7 +48,8 @@ let create_vm code =
     break_ptr = 0;
     call_ptr = 0; }
 
-(* microcode *)
+(* the IR microcode *)
+(* the IR the WASM gets translated into emulates a register machine *)
 
 type in_code =
  | NoIn
@@ -84,6 +86,8 @@ type out_code =
  | CallOut
  | NoOut
  | GlobalOut
+
+(* WASM types of operations *)
 
 type alu_code =
  | Unary of Ast.unop

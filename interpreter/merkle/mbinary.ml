@@ -8,6 +8,7 @@ type stream = {
   patches : (int * char) list ref
 }
 
+(* type strems with different insetions methods *)
 let stream () = {buf = Buffer.create 8192; patches = ref []}
 let pos s = Buffer.length s.buf
 let put s b = Buffer.add_char s.buf b
@@ -23,6 +24,7 @@ let to_bytes s =
 
 
 (* Encoding *)
+(* defining scalar types *)
 
 let s = stream ()
 
@@ -82,6 +84,8 @@ open Ast
 open Mrun
 
 let op x = Char.chr x
+
+(* WASM opcodes *)
 
 let alu_byte = function
  | Mrun.Nop -> op 0x00
